@@ -219,9 +219,13 @@ a schedule (cron/CI):
 
 Thin, opt-in (`pip install predictor[pytest]`), and dumb by design:
 
-- A session-scoped `validation_engine` fixture built from ini/CLI options
-  (model path, threshold, schema module).
-- Tests call `engine.ingest(...)` directly, or use a convenience fixture.
+- A session-scoped `validation_engine` fixture built from a user-named
+  factory (`--hve-engine module:factory`).
+- Tests feed measurements via the function-scoped `ingest` fixture —
+  `ingest("vout", 3.31)` — which fills `test_id` with the test function's
+  name (parametrization suffix stripped) and returns the value unchanged so
+  it can be asserted on inline. `engine.ingest(...)` remains available for
+  full control.
 - A hook wrapper catches `OrchestrationAbortError`, marks the current test as
   failed with the abort reason, and calls `session.shouldstop` so pytest's own
   teardown/fixture finalization runs normally.

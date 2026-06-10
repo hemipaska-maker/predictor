@@ -83,3 +83,31 @@ def test_missing_configuration_skips(pytester):
     pytester.makepyfile(test_suite=SUITE)
     result = pytester.runpytest("-p", "predictor.integrations.pytest_plugin")
     result.assert_outcomes(skipped=3)
+
+
+INGEST_SUITE = """
+import pytest
+
+def test_volt(ingest):
+    # the helper returns the value unchanged for inline assertions
+    assert ingest("vout", 3.3) == 3.3
+
+@pytest.mark.parametrize("amps", [0.9, 1.1])
+def test_curr(ingest, amps):
+    # parametrization suffix is stripped: test_id stays 'test_curr'
+    ingest("amps", amps)
+
+def test_temp(ingest):
+    ingest("temp_c", 130.0)  # crosses the threshold
+"""
+
+
+def test_ingest_fixture_maps_test_names_and_aborts(pytester):
+    pytester.makepyfile(engine_factory=FACTORY, test_suite=INGEST_SUITE)
+    pytester.syspathinsert()
+    result = pytester.runpytest(
+        "-p", "predictor.integrations.pytest_plugin",
+        "--hve-engine", "engine_factory:make_engine",
+    )
+    # volt + both curr params pass; temp aborts the session
+    result.assert_outcomes(passed=3, failed=1)

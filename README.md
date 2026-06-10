@@ -84,9 +84,19 @@ hardware, and you are done.
 pytest --hve-engine myproject.validation:make_engine
 ```
 
-where `make_engine()` returns a configured `ValidationEngine`. Tests use the
-session-scoped `validation_engine` fixture; an abort fails the current test,
-stops the session, and still runs every teardown.
+where `make_engine()` returns a configured `ValidationEngine`. Tests feed
+measurements through the `ingest` fixture, which fills in the test's name as
+`test_id` and returns the value unchanged for inline assertions:
+
+```python
+def test_3v3_rail(ingest, dmm, scope):
+    assert ingest("vout", dmm.measure_voltage("3V3")) > 3.2
+    assert ingest("ripple_mv", scope.measure_ripple_mv("3V3")) < 30
+```
+
+(The session-scoped `validation_engine` fixture is also available when you
+need the engine itself.) An abort fails the current test, stops the session,
+and still runs every teardown — hardware is released safely.
 
 ### Training & retraining
 

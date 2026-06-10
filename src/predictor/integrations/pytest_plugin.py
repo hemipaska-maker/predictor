@@ -75,6 +75,27 @@ def validation_engine(request: pytest.FixtureRequest) -> ValidationEngine:
     return engine
 
 
+@pytest.fixture
+def ingest(validation_engine: ValidationEngine, request: pytest.FixtureRequest):
+    """Feed a measurement for the current test: ``ingest("vout", 3.31)``.
+
+    A convenience over ``validation_engine.ingest`` that fills ``test_id``
+    with the test function's name (parametrization suffix stripped), so
+    schema entries line up with test names for free. Returns the measured
+    value unchanged, allowing inline use in assertions::
+
+        def test_3v3_rail(ingest, dmm):
+            assert ingest("vout", dmm.measure_voltage("3V3")) > 3.2
+    """
+    test_id = getattr(request.node, "originalname", None) or request.node.name
+
+    def _ingest(metric: str, value: float) -> float:
+        validation_engine.ingest(test_id, metric, value)
+        return value
+
+    return _ingest
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
     yield
