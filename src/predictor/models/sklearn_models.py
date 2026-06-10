@@ -168,7 +168,10 @@ class RandomForestPredictor(SklearnPredictor):
         defaults: dict[str, Any] = {
             "n_estimators": 300,
             "min_samples_leaf": 5,
-            "n_jobs": -1,
+            # n_jobs must stay 1: parallel predict accumulates tree votes in
+            # thread-completion order, and the non-associative float sums
+            # break bit-identical replays (determinism invariant).
+            "n_jobs": 1,
             "random_state": 0,
         }
         defaults.update(params)

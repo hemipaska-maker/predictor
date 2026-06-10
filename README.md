@@ -160,6 +160,20 @@ pip install -e .[sklearn]
 python examples/end_to_end.py        # add -v to stream the library's logs
 ```
 
+## Real-data examples
+
+Two open datasets, two honest outcomes (`examples/ai4i/`, `examples/secom/`):
+
+- **AI4I 2020** (UCI predictive maintenance, 10k machine cycles, 3.4%
+  failures) — `python examples/ai4i/ai4i_e2e.py` downloads, trains, promotes,
+  then replays holdout units through the live engine: **64% of never-seen
+  failing units abort early** (5% false aborts), and replaying a unit twice
+  yields the bit-identical trajectory and abort point.
+- **SECOM** (UCI semiconductor fab) — the documented *negative* result: with
+  an honest temporal split the dataset has no transferable signal, and the
+  promotion gate's false-abort cap correctly refuses to deploy anything
+  aggressive. Knowing when not to abort is part of the design.
+
 ## Documentation
 
 - [DESIGN.md](DESIGN.md) — full architecture and the reasoning behind it

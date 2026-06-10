@@ -40,8 +40,9 @@ def simulate_fail_fast(
     ``probabilities`` is aligned with the full dataset rows (values outside
     ``mask`` are ignored). Returns the business metrics:
     - early_catch_rate: failing runs aborted before completion.
-    - mean_fraction_saved: mean fraction of a failing run's remaining
-      snapshots skipped (proxy for machine time reclaimed).
+    - mean_fraction_saved: mean fraction of snapshots skipped across ALL
+      failing runs — a missed run saves 0. (Averaging only caught runs would
+      reward a model that catches one run early and misses the rest.)
     - false_abort_rate: passing runs wrongly killed — the cost side.
     """
     caught, saved_fractions, false_aborts = 0, [], 0
@@ -60,6 +61,8 @@ def simulate_fail_fast(
             if aborted_at is not None:
                 caught += 1
                 saved_fractions.append(1.0 - (aborted_at + 1) / n_steps)
+            else:
+                saved_fractions.append(0.0)
         else:
             n_passed_runs += 1
             if aborted_at is not None:
