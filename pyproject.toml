@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "predictor"
+version = "0.1.0.dev0"
+description = "ML-driven hardware validation engine with a fail-fast core"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+# The core is intentionally dependency-free (framework-agnostic, stdlib only).
+dependencies = []
+
+[project.optional-dependencies]
+sklearn = ["scikit-learn>=1.4", "numpy>=1.26", "joblib>=1.3"]
+pytest = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "ruff>=0.4"]
+
+[project.entry-points.pytest11]
+predictor = "predictor.integrations.pytest_plugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/predictor"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

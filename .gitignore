@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Demo artifacts (regenerated on every run)
+examples/demo_output/
+
+# Local model artifacts and bench records
+*.joblib
+records/
+registry/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
