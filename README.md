@@ -115,6 +115,40 @@ if should_promote(result.metrics, registry.latest_metrics(schema.schema_hash)):
 Run this on a schedule; `predictor.training.drift_report` tells you when the
 model has gone stale between retrains.
 
+## Choosing a model
+
+The engine is not bound to any algorithm — it only knows the
+`FailurePredictor` interface (one method returning P(suite failure) in
+[0, 1]). Two adapters ship with the `[sklearn]` extra:
+
+| Adapter | Backed by | Trade-off |
+|---|---|---|
+| `RandomForestPredictor` | `RandomForestClassifier` | Stable, robust to hardware noise. The recommended default. |
+| `GradientBoostingPredictor` | `HistGradientBoostingClassifier` | Higher accuracy ceiling; ships strictly regularized to resist overfitting small datasets. |
+
+Both are trained through the same `train_candidate(...)` call (pass the
+class), calibrated so thresholds carry real probability meaning, and saved
+with a `kind` tag — `load_predictor(path)` reconstructs the right adapter
+automatically, so deployments never hardcode a model type.
+
+To bring your own model, either subclass
+`predictor.models.SklearnPredictor` (gets training, calibration, and
+persistence for free) or implement `predictor.FailurePredictor` directly —
+even a hand-written heuristic works:
+
+```python
+from predictor import FailurePredictor
+
+class HotVrmHeuristic(FailurePredictor):
+    def predict_failure_probability(self, state):
+        temp = state[6]                      # index from your FeatureSchema
+        return 0.95 if temp == temp and temp > 70 else 0.05  # NaN-aware
+
+engine = ValidationEngine(schema, HotVrmHeuristic(), threshold=0.85)
+```
+
+The orchestration code never changes when the model does.
+
 ## Demo
 
 A complete, realistic walkthrough — shadow-mode data capture, training and
