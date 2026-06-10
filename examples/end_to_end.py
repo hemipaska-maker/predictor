@@ -2,7 +2,7 @@
 
 Scenario
 --------
-A bench validates power boards with an 8-test suite (~55 minutes of machine
+A bench validates power boards with an 8-test suite (~38 minutes of machine
 time per board, dominated by burn-in and an EMC chamber scan). The demo walks
 the full lifecycle of this engine:
 
@@ -14,17 +14,17 @@ the full lifecycle of this engine:
                           versioned model registry.
   PART 3  Live bench    - the promoted model + hard safety rules drive three
                           sessions: a healthy board, a degrading VRM (ML abort
-                          saves ~40 min), and a short circuit (rule abort).
+                          saves ~36 min), and a short circuit (rule abort).
   PART 4  Drift check   - a simulated hardware revision shifts thermals; the
                           drift monitor flags the affected features.
 
 Run it:    python examples/end_to_end.py
-Verbose:   python examples/end_to_end.py -v   (streams the library's logs)
+Verbose:   python examples/end_to_end.py -v   (adds the library's own logs)
 
-Note on output: the formatted report below is printed deliberately — it is
-this script's user interface. The library itself never prints; it logs
-through `logging` and stays silent unless the application opts in (as the
--v flag does here).
+Logging layout: the report you see on stdout is emitted through a dedicated
+message-only logger (no prints); the predictor library logs independently to
+stderr and stays quiet unless -v raises its level. This mirrors how a real
+application should consume the library.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ from pathlib import Path
 
 import numpy as np
 
+# Make the demo runnable from a source checkout without installing.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from predictor import (
@@ -58,30 +59,35 @@ from predictor.training import (
     ModelRegistry,
     build_dataset,
     drift_report,
-    evaluate,
     should_promote,
-    temporal_split,
     train_candidate,
 )
+
+#: The demo's report channel. Configured in _configure_logging() with a
+#: bare "%(message)s" format so the output reads as a report, not a log dump.
+LOG = logging.getLogger("end_to_end")
 
 OUT = Path(__file__).resolve().parent / "demo_output"
 ABORT_THRESHOLD = 0.85
 
 # ---------------------------------------------------------------------------
 # The validation suite: (test_id, [metrics], duration in seconds).
-# Cheap electrical checks run first; burn-in and the EMC chamber dominate cost.
+# Cheap electrical checks run first; burn-in and the EMC chamber dominate
+# cost — which is exactly why aborting before them is worth real money.
 # ---------------------------------------------------------------------------
 SUITE = [
-    ("test_power_on",       ["vbus_v", "inrush_a"],               8),
-    ("test_3v3_rail",       ["vout_v", "ripple_mv"],             12),
-    ("test_5v_rail",        ["vout_v", "ripple_mv"],             12),
-    ("test_vrm_thermal",    ["temp_c", "temp_rise_c"],           45),
-    ("test_load_step",      ["sag_mv", "recovery_us"],           30),
-    ("test_clock_integrity",["jitter_ps", "freq_error_ppm"],     60),
-    ("test_burn_in",        ["peak_temp_c", "current_drift_pct"],900),
-    ("test_emc_scan",       ["worst_margin_db"],               1200),
+    ("test_power_on",        ["vbus_v", "inrush_a"],                 8),
+    ("test_3v3_rail",        ["vout_v", "ripple_mv"],               12),
+    ("test_5v_rail",         ["vout_v", "ripple_mv"],               12),
+    ("test_vrm_thermal",     ["temp_c", "temp_rise_c"],             45),
+    ("test_load_step",       ["sag_mv", "recovery_us"],             30),
+    ("test_clock_integrity", ["jitter_ps", "freq_error_ppm"],       60),
+    ("test_burn_in",         ["peak_temp_c", "current_drift_pct"], 900),
+    ("test_emc_scan",        ["worst_margin_db"],                 1200),
 ]
 
+# The fixed feature layout: one slot per (test_id, metric), in suite order.
+# Models are trained against this exact layout; its hash gates deployment.
 SCHEMA = FeatureSchema(
     [(test_id, metric) for test_id, metrics, _ in SUITE for metric in metrics]
 )
@@ -108,7 +114,8 @@ NOMINAL = {
 }
 
 # Failure modes: additive offsets to the nominal means. Each mode leaves an
-# early fingerprint long before the test that finally fails.
+# early fingerprint long before the test that finally fails — that gap
+# between "first symptom" and "actual failure" is what the model exploits.
 FAILURE_MODES = {
     # Degrading voltage regulator: runs hot early, fails burn-in at the end.
     "vrm_degraded": {
@@ -127,6 +134,9 @@ FAILURE_MODES = {
     },
 }
 
+MODE_NAMES = ["healthy", "vrm_degraded", "supply_noise"]
+MODE_PROBS = [0.72, 0.14, 0.14]
+
 
 def simulate_run(rng: np.random.Generator, mode: str | None):
     """Yield (test_id, metric, value) readings for one board, in suite order."""
@@ -138,14 +148,18 @@ def simulate_run(rng: np.random.Generator, mode: str | None):
             yield test_id, metric, value
 
 
+# ---------------------------------------------------------------------------
+# Report formatting helpers
+# ---------------------------------------------------------------------------
 def section(title: str) -> None:
-    print()
-    print("=" * 72)
-    print(f"  {title}")
-    print("=" * 72)
+    LOG.info("")
+    LOG.info("=" * 72)
+    LOG.info("  %s", title)
+    LOG.info("=" * 72)
 
 
 def prob_bar(p: float | None, width: int = 24) -> str:
+    """Render a probability as an ASCII bar; None means the warm-up gate."""
     if p is None:
         return "[ warming up" + " " * (width - 11) + "]   --"
     filled = int(round(p * width))
@@ -165,13 +179,18 @@ def fmt_metrics(m: dict) -> str:
 # PART 1 - shadow mode: record history, no fail-fast yet
 # ---------------------------------------------------------------------------
 def generate_history(rng: np.random.Generator, n_runs: int, path: Path) -> dict:
+    """Replay n_runs boards through a recorder only — no model, no aborts.
+
+    This is the bootstrap phase of a real deployment: the engine ships
+    recording-only until enough labeled history exists to train on.
+    """
     recorder = JsonlRecorder(path)
-    counts = {"healthy": 0, "vrm_degraded": 0, "supply_noise": 0}
+    counts = dict.fromkeys(MODE_NAMES, 0)
     for _ in range(n_runs):
-        mode = rng.choice(
-            ["healthy", "vrm_degraded", "supply_noise"], p=[0.72, 0.14, 0.14]
-        )
+        mode = rng.choice(MODE_NAMES, p=MODE_PROBS)
         counts[mode] += 1
+        # Mirror exactly what ValidationEngine would record: the progressive
+        # state vector after every single measurement.
         state = StateVector(SCHEMA)
         for test_id, metric, value in simulate_run(rng, mode):
             state.update(test_id, metric, value)
@@ -184,7 +203,8 @@ def generate_history(rng: np.random.Generator, n_runs: int, path: Path) -> dict:
 # PART 3 - live bench sessions against the promoted model
 # ---------------------------------------------------------------------------
 SAFETY_RULES = [
-    # Catastrophic events bypass the ML model entirely (DESIGN.md §3.3).
+    # Catastrophic events bypass the ML model entirely (DESIGN.md §3.3):
+    # these bounds protect the hardware, the model only protects the schedule.
     BoundsRule("vbus_v", min_value=10.5, max_value=13.5),
     BoundsRule("peak_temp_c", max_value=110.0),
 ]
@@ -192,13 +212,16 @@ SAFETY_RULES = [
 
 def run_bench_session(name: str, mode: str | None, model_path: Path,
                       rng: np.random.Generator) -> None:
-    print(f"\n--- Session: {name} " + "-" * (50 - len(name)))
+    """Execute one board's suite through a fresh engine, narrating each step."""
+    LOG.info("")
+    LOG.info("--- Session: %s %s", name, "-" * max(0, 50 - len(name)))
+    # One engine per board: the state vector represents a single run.
     engine = ValidationEngine(
         SCHEMA,
         load_predictor(str(model_path)),
         threshold=ABORT_THRESHOLD,
         rules=SAFETY_RULES,
-        min_coverage=0.10,
+        min_coverage=0.10,  # no predictions until 10% of the vector is real
         recorder=JsonlRecorder(OUT / "live_records.jsonl"),
     )
     elapsed = 0.0
@@ -206,30 +229,60 @@ def run_bench_session(name: str, mode: str | None, model_path: Path,
     try:
         for test_id, metric, value in simulate_run(rng, mode):
             if test_id != current_test:
+                # Account machine time once per test, when it starts.
                 current_test = test_id
                 elapsed += DURATION[test_id]
             line = f"  {test_id:<22} {metric:<18} {value:9.2f}"
             try:
                 p = engine.ingest(test_id, metric, value)
             except OrchestrationAbortError:
-                print(line + "   << abort triggered by this reading")
+                # Show the offending reading before re-raising: ingest()
+                # raises before this line would otherwise be reported.
+                LOG.info("%s   << abort triggered by this reading", line)
                 raise
-            print(line + f"   {prob_bar(p)}")
+            LOG.info("%s   %s", line, prob_bar(p))
         engine.finalize(suite_passed=True)
-        print(f"  >> SUITE PASSED in {TOTAL_SECS / 60:.0f} min of machine time.")
+        LOG.info("  >> SUITE PASSED in %.0f min of machine time.", TOTAL_SECS / 60)
     except RuleAbort as exc:
+        # Deterministic safety abort: the model was never consulted.
         engine.finalize(suite_passed=False)
-        print(f"  !! RULE ABORT (ML bypassed): {exc}")
-        print(f"  >> Hardware protected after ~{elapsed / 60:.0f} min; "
-              f"runner tears down the bench safely.")
+        LOG.info("  !! RULE ABORT (ML bypassed): %s", exc)
+        LOG.info("  >> Hardware protected after ~%.0f min; "
+                 "runner tears down the bench safely.", elapsed / 60)
     except MLThresholdAbort as exc:
+        # Probabilistic abort: the suite is statistically doomed, stop paying
+        # for burn-in and the EMC chamber.
         engine.finalize(suite_passed=False)
-        saved = TOTAL_SECS - elapsed
-        print(f"  !! ML ABORT: P(failure)={exc.probability:.1%} "
-              f">= threshold {exc.threshold:.0%}")
-        print(f"  >> Aborted after ~{elapsed / 60:.0f} min; "
-              f"~{saved / 60:.0f} min of machine time reclaimed "
-              f"(burn-in + EMC chamber skipped).")
+        LOG.info("  !! ML ABORT: P(failure)=%.1f%% >= threshold %.0f%%",
+                 exc.probability * 100, exc.threshold * 100)
+        LOG.info("  >> Aborted after ~%.0f min; ~%.0f min of machine time "
+                 "reclaimed (burn-in + EMC chamber skipped).",
+                 elapsed / 60, (TOTAL_SECS - elapsed) / 60)
+
+
+def _configure_logging(verbose: bool) -> None:
+    """Set up the two output streams.
+
+    - The demo report: bare messages on stdout (this script's UI).
+    - The predictor library: level-prefixed records on stderr, visible only
+      with -v. The library itself never prints — it just logs and the
+      application decides what to surface.
+    """
+    report = logging.StreamHandler(sys.stdout)
+    report.setFormatter(logging.Formatter("%(message)s"))
+    LOG.addHandler(report)
+    LOG.setLevel(logging.INFO)
+    LOG.propagate = False  # keep report lines away from other handlers
+
+    library = logging.StreamHandler(sys.stderr)
+    library.setFormatter(
+        logging.Formatter("%(levelname)-7s %(name)s: %(message)s")
+    )
+    lib_logger = logging.getLogger("predictor")
+    lib_logger.addHandler(library)
+    # The report already narrates aborts; without -v the library stays quiet
+    # rather than echoing each abort warning a second time.
+    lib_logger.setLevel(logging.DEBUG if verbose else logging.ERROR)
 
 
 def main() -> None:
@@ -240,73 +293,78 @@ def main() -> None:
         action="store_true",
         help="show the predictor library's internal logs alongside the report",
     )
-    args = parser.parse_args()
-    logging.basicConfig(format="%(levelname)-7s %(name)s: %(message)s")
-    # The report below already narrates aborts, so without -v the library is
-    # kept quiet rather than echoing each abort warning a second time.
-    logging.getLogger("predictor").setLevel(
-        logging.DEBUG if args.verbose else logging.ERROR
-    )
+    _configure_logging(parser.parse_args().verbose)
 
+    # Fresh artifacts every run: the demo is fully reproducible (seeded RNGs).
     if OUT.exists():
         shutil.rmtree(OUT)
     OUT.mkdir(parents=True)
     rng = np.random.default_rng(42)
 
+    # -- PART 1 -------------------------------------------------------------
     section("PART 1  Shadow mode: recording 120 historical validation runs")
     history = OUT / "history.jsonl"
     counts = generate_history(rng, 120, history)
-    print(f"  Suite: {len(SUITE)} tests, {len(SCHEMA)} metrics, "
-          f"{TOTAL_SECS / 60:.0f} min of machine time per board")
-    print(f"  Recorded -> {history}")
-    print(f"  Outcomes: {counts['healthy']} passed, "
-          f"{counts['vrm_degraded']} failed (VRM degradation), "
-          f"{counts['supply_noise']} failed (supply noise)")
+    LOG.info("  Suite: %d tests, %d metrics, %.0f min of machine time per board",
+             len(SUITE), len(SCHEMA), TOTAL_SECS / 60)
+    LOG.info("  Recorded -> %s", history)
+    LOG.info("  Outcomes: %d passed, %d failed (VRM degradation), "
+             "%d failed (supply noise)",
+             counts["healthy"], counts["vrm_degraded"], counts["supply_noise"])
 
+    # -- PART 2 -------------------------------------------------------------
     section("PART 2  Training: temporal split, two candidates, promotion gate")
     dataset = build_dataset([history], SCHEMA.schema_hash)
-    print(f"  Dataset: {dataset.X.shape[0]} snapshots from {dataset.n_runs} runs "
-          f"(every partial state is a training row)")
+    LOG.info("  Dataset: %d snapshots from %d runs "
+             "(every partial state is a training row)",
+             dataset.X.shape[0], dataset.n_runs)
 
+    # Train both shipped model families on identical data and let the
+    # promotion gate decide — nothing in the pipeline favors either.
     candidates = {}
     for cls in (RandomForestPredictor, GradientBoostingPredictor):
         result = train_candidate(
             dataset, cls, threshold=ABORT_THRESHOLD, holdout_fraction=0.2
         )
         candidates[cls.kind] = result
-        print(f"  {cls.__name__:<28} holdout: {fmt_metrics(result.metrics)}")
+        LOG.info("  %-28s holdout: %s", cls.__name__, fmt_metrics(result.metrics))
 
     rf, gb = candidates["random_forest"], candidates["hist_gradient_boosting"]
     winner = gb if should_promote(gb.metrics, rf.metrics) else rf
-    print(f"  Promotion gate picks: {type(winner.predictor).__name__} "
-          f"(false-abort cap, then time saved, Brier as tiebreaker)")
+    LOG.info("  Promotion gate picks: %s "
+             "(false-abort cap, then time saved, Brier as tiebreaker)",
+             type(winner.predictor).__name__)
 
     registry = ModelRegistry(OUT / "registry")
     artifact = registry.save(winner.predictor, winner.metrics)
-    print(f"  Registered -> {artifact.name} (+ metrics sidecar)")
+    LOG.info("  Registered -> %s (+ metrics sidecar)", artifact.name)
 
+    # -- PART 3 -------------------------------------------------------------
     section("PART 3  Live bench: promoted model + hard safety rules")
     model_path = registry.latest(SCHEMA.schema_hash)
-    print(f"  Engine: threshold={ABORT_THRESHOLD:.0%}, min_coverage=10%, "
-          f"rules on vbus_v and peak_temp_c")
+    LOG.info("  Engine: threshold=%.0f%%, min_coverage=10%%, "
+             "rules on vbus_v and peak_temp_c", ABORT_THRESHOLD * 100)
     run_bench_session("healthy board", "healthy", model_path, rng)
     run_bench_session("degrading VRM (ML fail-fast)", "vrm_degraded", model_path, rng)
 
     # Catastrophic short circuit: vbus collapses on the very first reading.
-    print(f"\n--- Session: short circuit (rule override) " + "-" * 18)
+    # Fed manually (not via simulate_run) because no distribution produces it.
+    LOG.info("")
+    LOG.info("--- Session: short circuit (rule override) %s", "-" * 18)
     engine = ValidationEngine(
         SCHEMA, load_predictor(str(model_path)),
         threshold=ABORT_THRESHOLD, rules=SAFETY_RULES,
         recorder=JsonlRecorder(OUT / "live_records.jsonl"),
     )
     try:
-        print(f"  {'test_power_on':<22} {'vbus_v':<18} {0.42:9.2f}   (!!)")
+        LOG.info("  %-22s %-18s %9.2f   (!!)", "test_power_on", "vbus_v", 0.42)
         engine.ingest("test_power_on", "vbus_v", 0.42)
     except OrchestrationAbortError as exc:
         engine.finalize(suite_passed=False)
-        print(f"  !! RULE ABORT (ML bypassed): {exc}")
-        print(f"  >> Aborted in milliseconds -- the model was never consulted.")
+        LOG.info("  !! RULE ABORT (ML bypassed): %s", exc)
+        LOG.info("  >> Aborted in milliseconds -- the model was never consulted.")
 
+    # -- PART 4 -------------------------------------------------------------
     section("PART 4  Drift check: simulated hardware revision (rev B)")
     # Rev B runs its VRM ~6 degC hotter while staying within spec. Compare
     # per-board readings (one fully-observed snapshot per run) with the same
@@ -315,26 +373,26 @@ def main() -> None:
     rev_b = np.random.default_rng(7)
     rows = []
     for _ in range(240):
-        mode = rev_b.choice(
-            ["healthy", "vrm_degraded", "supply_noise"], p=[0.72, 0.14, 0.14]
-        )
+        mode = rev_b.choice(MODE_NAMES, p=MODE_PROBS)
         state = StateVector(SCHEMA)
         for test_id, metric, value in simulate_run(rev_b, mode):
             if metric in ("temp_c", "temp_rise_c", "peak_temp_c"):
-                value += 6.0
+                value += 6.0  # the revision's thermal signature
             state.update(test_id, metric, value)
-        rows.append(state.snapshot())
+        rows.append(state.snapshot())  # final snapshot = the board's readings
     report = drift_report(baseline_rows, np.asarray(rows))
     flagged = [SCHEMA.features[i] for i in report["flagged_features"]]
-    print(f"  max PSI = {report['max_psi']:.2f}  "
-          f"max missing-rate shift = {report['max_missing_shift']:.2f}")
-    print(f"  Flagged features: {', '.join(f'{t}.{m}' for t, m in flagged)}")
-    print(f"  Retrain recommended: {report['retrain_recommended']}")
+    LOG.info("  max PSI = %.2f  max missing-rate shift = %.2f",
+             report["max_psi"], report["max_missing_shift"])
+    LOG.info("  Flagged features: %s",
+             ", ".join(f"{t}.{m}" for t, m in flagged))
+    LOG.info("  Retrain recommended: %s", report["retrain_recommended"])
     if report["retrain_recommended"]:
-        print("  -> the scheduled pipeline (PART 2) reruns on fresh records; "
-              "the promotion gate decides if rev-B data produces a better model.")
+        LOG.info("  -> the scheduled pipeline (PART 2) reruns on fresh records; "
+                 "the promotion gate decides if rev-B data produces a better model.")
 
-    print(f"\nAll artifacts under: {OUT}")
+    LOG.info("")
+    LOG.info("All artifacts under: %s", OUT)
 
 
 if __name__ == "__main__":
